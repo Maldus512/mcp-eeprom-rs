@@ -8,24 +8,24 @@ const PAGESIZE: usize = 128;
 const DEFAULT_ADDRESS: u8 = 0x50;
 
 ///Errors
-#[derive(Debug)]
-pub enum Error<E> {
+pub enum Error<E : Write + WriteRead> {
     OutOfRange,
     TooMuchData,
-    I2c(E),
+    I2cWriteRead(<E as WriteRead>::Error),
+    I2cWrite(<E as Write>::Error),
 }
 
-pub struct Eeprom<'a, I2C, WP: OutputPin, CLOCK: Clock> {
+pub struct Eeprom<'a, I2C : Write + WriteRead, WP: OutputPin, CLOCK: Clock> {
     address: u8,
-    i2c: core::marker::PhantomData<I2C>,
+    i2c: I2C,
     wp: WP,
     clock: &'a CLOCK,
 }
 
-impl<'a, I2C, WP: OutputPin, CLOCK: Clock> Eeprom<'a, I2C, WP, CLOCK> {
-    pub fn new(wp: WP, clock: &'a CLOCK) -> Self {
+impl<'a, I2C: Write + WriteRead, WP: OutputPin, CLOCK: Clock> Eeprom<'a, I2C, WP, CLOCK> {
+    pub fn new(i2c : I2C, wp: WP, clock: &'a CLOCK) -> Self {
         Eeprom {
-            i2c: core::marker::PhantomData,
+            i2c,
             address: DEFAULT_ADDRESS,
             wp,
             clock,
@@ -42,11 +42,9 @@ impl<'a, I2C, WP: OutputPin, CLOCK: Clock> Eeprom<'a, I2C, WP, CLOCK> {
 
         result
     }
-}
 
-impl<'a, I2C: Write, WP: OutputPin, CLOCK: Clock> Eeprom<'a, I2C, WP, CLOCK> {
     //TODO: AFAIK STM32 I2C modules do not allow proper ack polling, so I need to replace it with an adequately long delay
-    pub fn ack_polling(&mut self) -> Result<(), Error<I2C::Error>> {
+    pub fn ack_polling(&mut self) -> Result<(), Error<I2C>> {
         self.clock
             .new_timer(Milliseconds::new(5))
             .start()
@@ -61,10 +59,9 @@ impl<'a, I2C: Write, WP: OutputPin, CLOCK: Clock> Eeprom<'a, I2C, WP, CLOCK> {
 
     pub fn write_byte(
         &mut self,
-        i2c: &mut I2C,
         addr: u16,
         byte: u8,
-    ) -> Result<(), Error<I2C::Error>> {
+    ) -> Result<(), Error<I2C>> {
         if addr as usize > AVAILABLE_STORAGE {
             return Err(Error::OutOfRange);
         }
@@ -76,8 +73,8 @@ impl<'a, I2C: Write, WP: OutputPin, CLOCK: Clock> Eeprom<'a, I2C, WP, CLOCK> {
         let addr = addr.to_be_bytes();
 
         self.with_wp_low(|eeprom| {
-            i2c.write(eeprom.address, &[addr[0], addr[1], byte])
-                .map_err(Error::I2c)
+            eeprom.i2c.write(eeprom.address, &[addr[0], addr[1], byte])
+                .map_err(Error::I2cWrite)
         })?;
 
         Ok(())
@@ -85,10 +82,9 @@ impl<'a, I2C: Write, WP: OutputPin, CLOCK: Clock> Eeprom<'a, I2C, WP, CLOCK> {
 
     pub fn write_data(
         &mut self,
-        i2c: &mut I2C,
         addr: u16,
         data: &[u8],
-    ) -> Result<(), Error<I2C::Error>> {
+    ) -> Result<(), Error<I2C>> {
         if addr as usize > AVAILABLE_STORAGE {
             return Err(Error::OutOfRange);
         }
@@ -114,8 +110,8 @@ impl<'a, I2C: Write, WP: OutputPin, CLOCK: Clock> Eeprom<'a, I2C, WP, CLOCK> {
             writebuf[2..2 + pagesize].clone_from_slice(&data[wrptr..wrptr + pagesize]);
 
             self.with_wp_low(|eeprom| {
-                i2c.write(eeprom.address, &writebuf[0..pagesize + 2])
-                    .map_err(Error::I2c)?;
+                eeprom.i2c.write(eeprom.address, &writebuf[0..pagesize + 2])
+                    .map_err(Error::I2cWrite)?;
                 eeprom.ack_polling()
             })?;
 
@@ -125,10 +121,8 @@ impl<'a, I2C: Write, WP: OutputPin, CLOCK: Clock> Eeprom<'a, I2C, WP, CLOCK> {
 
         Ok(())
     }
-}
 
-impl<'a, I2C: WriteRead, WP: OutputPin, CLOCK: Clock> Eeprom<'a, I2C, WP, CLOCK> {
-    pub fn read_byte(&mut self, i2c: &mut I2C, addr: u16) -> Result<u8, Error<I2C::Error>> {
+    pub fn read_byte(&mut self, addr: u16) -> Result<u8, Error<I2C>> {
         if addr as usize > AVAILABLE_STORAGE {
             return Err(Error::OutOfRange);
         }
@@ -137,17 +131,16 @@ impl<'a, I2C: WriteRead, WP: OutputPin, CLOCK: Clock> Eeprom<'a, I2C, WP, CLOCK>
             return Err(Error::TooMuchData);
         }
         let mut byte: [u8; 1] = [0];
-        i2c.write_read(self.address, &addr.to_be_bytes(), &mut byte)
-            .map_err(Error::I2c)?;
+        self.i2c.write_read(self.address, &addr.to_be_bytes(), &mut byte)
+            .map_err(Error::I2cWriteRead)?;
         Ok(byte[0])
     }
 
     pub fn read_data(
         &mut self,
-        i2c: &mut I2C,
         addr: u16,
         data: &mut [u8],
-    ) -> Result<(), Error<I2C::Error>> {
+    ) -> Result<(), Error<I2C>> {
         if addr as usize > AVAILABLE_STORAGE {
             return Err(Error::OutOfRange);
         }
@@ -155,8 +148,8 @@ impl<'a, I2C: WriteRead, WP: OutputPin, CLOCK: Clock> Eeprom<'a, I2C, WP, CLOCK>
         if addr as usize + data.len() > AVAILABLE_STORAGE {
             return Err(Error::TooMuchData);
         }
-        i2c.write_read(self.address, &addr.to_be_bytes(), data)
-            .map_err(Error::I2c)?;
+        self.i2c.write_read(self.address, &addr.to_be_bytes(), data)
+            .map_err(Error::I2cWriteRead)?;
         Ok(())
     }
 }
